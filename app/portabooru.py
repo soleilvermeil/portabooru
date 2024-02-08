@@ -3,10 +3,10 @@ import requests
 import json
 import math
 from tqdm import tqdm
-import dotenv
 from multiprocessing import Pool, cpu_count
 import logging
 import glob
+
 
 INPUT_FOLDER = "./inputs"
 OUTPUT_FOLDER = "./outputs"
@@ -29,6 +29,7 @@ STATUS_CODE = {
     502: "Bad Gateway",
     503: "Service Unavailable"
 }
+
 
 def login(username: str, api_key: str) -> None:
     """
@@ -54,6 +55,7 @@ def login(username: str, api_key: str) -> None:
         exit(1)
     logging.info("success!")
 
+
 def unpack(args):
     """
     Unpacks the arguments and calls the function with the unpacked arguments.
@@ -65,6 +67,7 @@ def unpack(args):
     func = args[0]
     args = args[1:]
     return func(*args)
+
 
 def download_image(info: dict, tag: str, only_infos: bool = False) -> None:
     """
@@ -111,7 +114,11 @@ def download_image(info: dict, tag: str, only_infos: bool = False) -> None:
         logging.debug(f"ignored (extension: {extension}).")
         return
     if not only_infos:
-        image_response = requests.get(image_url)
+        try:
+            image_response = requests.get(image_url)
+        except requests.exceptions.ConnectionError:
+            logging.debug("ignored (connection error).")
+            return
         image_data = image_response.content
         with open(imagepath, "wb") as f:
             f.write(image_data)
@@ -120,6 +127,7 @@ def download_image(info: dict, tag: str, only_infos: bool = False) -> None:
     with open(jsonpath, "w") as f:
         json.dump(info, f, indent=4)
     logging.debug("done!")
+
 
 def get_images_count(tag: str) -> int:
     """
@@ -136,6 +144,7 @@ def get_images_count(tag: str) -> int:
     count_url = f"{BASE_URL}/tags.json?search[name]={tag}"
     response = requests.get(count_url)
     return response.json()[0]['post_count']
+
 
 def get_downloaded_ids(tag: str, rating: str | None = None) -> list[int]:
     """
@@ -179,11 +188,13 @@ def get_images_infos(tag: str, limit: int | None = None, rating: str | None = No
         limit = images_count - len(downloaded_ids)
         logging.info(f"{images_count} images found corresponding to this tag.")
         logging.info(f"{len(downloaded_ids)} images already downloaded.")
+        logging.info(f"{limit} images to download.")
     page_limit = math.ceil(limit / MAX_ITEMS_PER_PAGE)
     with tqdm(total=limit, desc="Getting images informations") as pbar:
         for page in range(1, page_limit + 1):
-            max_items_for_current_page = MAX_ITEMS_PER_PAGE
-            if page == page_limit:
+            if page != page_limit:
+                max_items_for_current_page = MAX_ITEMS_PER_PAGE
+            else:
                 max_items_for_current_page = limit - MAX_ITEMS_PER_PAGE * (page_limit - 1)
             # TODO: improve the following line using for example requests.get(..., params=params)
             # NOTE: requests.get() automatically encodes the parameters, which is not wanted since a lot of tags contain special characters
@@ -198,7 +209,11 @@ def get_images_infos(tag: str, limit: int | None = None, rating: str | None = No
             images_url += "&"
             images_url += f"limit={max_items_for_current_page}&"
             images_url += f"page={page}&"
-            response = requests.get(images_url)
+            try:
+                response = requests.get(images_url)
+            except requests.exceptions.ConnectionError:
+                print("Connection error. Retrying...")
+                continue
             if response.status_code != 200:
                 continue
             items = response.json()
@@ -208,6 +223,7 @@ def get_images_infos(tag: str, limit: int | None = None, rating: str | None = No
             pbar.update(len(items))
     return result
 
+
 if __name__ == "__main__":
 
     # Setting up the logger
@@ -215,10 +231,16 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)8s] --- %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     
+    # Setting up the folders
+    # ----------------------
+
+    if os.getenv("RUNNING_IN_DOCKER"):
+        INPUT_FOLDER = "/inputs"
+        OUTPUT_FOLDER = "/outputs"
+
     # Connecting to the API
     # ---------------------
 
-    dotenv.load_dotenv()
     username = os.getenv("NAME")
     api_key = os.getenv("API_KEY")
     login(username, api_key)
@@ -229,10 +251,13 @@ if __name__ == "__main__":
     # ---------------------
 
     tags = open(os.path.join(INPUT_FOLDER, "tags.txt"), "r").read().splitlines()
+    logging.info(f"Tags found ('*' for metadata only):")
+    for tag in tags:
+        logging.info(f"  - {tag}")
     only_metadatas = [True if tags.startswith("*") else False for tags in tags]
     tags = [tags[1:] if tags.startswith("*") else tags for tags in tags]
-    logging.info(f"Tags found: {tags}")
     for tag, only_metadata in zip(tags, only_metadatas):
+        logging.info(f"Starting collecting images for tag '{tag}'.")
         tag = tag.strip()
         kwargs = {"tag": tag}
         infos = get_images_infos(**kwargs)
