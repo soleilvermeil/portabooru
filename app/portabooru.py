@@ -132,6 +132,8 @@ def download_image(info: dict, tag: str, only_infos: bool = False) -> None:
         f.write("\n".join(tags.split(" ")))
     with open(jsonpath, "w") as f:
         json.dump(info, f, indent=4)
+    with open(os.path.join(OUTPUT_FOLDER, formatted_tag, "manifest.txt"), "a") as f:
+        f.write(f"{id}\n")
     logging.debug("done!")
 
 
@@ -170,6 +172,11 @@ def get_downloaded_ids(tag: str, rating: str | None = None) -> list[int]:
         path = os.path.join(path, rating)
     files = glob.glob(f"{path}/*/*_infos.json", recursive=True)
     ids = [int(os.path.basename(file).split("_")[0]) for file in files]
+    manifest_ids = []
+    try:
+        manifest_ids = open(os.path.join(path, "manifest.txt"), "r").read().splitlines()
+    except FileNotFoundError:
+        pass
     return ids
 
 def get_images_infos(tag: str, limit: int | None = None, rating: str | None = None) -> list[dict]:
