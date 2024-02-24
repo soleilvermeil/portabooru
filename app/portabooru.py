@@ -12,6 +12,8 @@ INPUT_FOLDER = "./inputs"
 OUTPUT_FOLDER = "./outputs"
 BASE_URL = "https://danbooru.donmai.us"
 MAX_ITEMS_PER_PAGE = 200
+SUCCESSIVE_ERRORS_LIMIT = 5
+FORBIDDEN_EXTENSIONS = [] # ["mp4", "zip"]
 STATUS_CODE = {
     200: "OK",
     204: "No Content",
@@ -83,6 +85,7 @@ def download_image(info: dict, tag: str, only_infos: bool = False) -> None:
     -------
     None
     """
+    downloaded_ids = get_downloaded_ids(tag)
     logging.debug("Reading image informations...")
     try:
         id = info['id']
@@ -92,6 +95,9 @@ def download_image(info: dict, tag: str, only_infos: bool = False) -> None:
         rating = info['rating']
     except KeyError:
         logging.debug("ignored (wrong formatting).")
+        return
+    if id in downloaded_ids:
+        logging.debug("ignored (already downloaded).")
         return
     formatted_tag = tag
     for chars in ["<", ">", ":", "\"", "\\", "|", "?", "*"]:
@@ -110,7 +116,7 @@ def download_image(info: dict, tag: str, only_infos: bool = False) -> None:
         logging.debug("ignored (already exists).")
         return
     logging.debug(f"trying to download image with id '{id}'...")
-    if extension in ["mp4", "zip"]:
+    if extension.lower() in FORBIDDEN_EXTENSIONS:
         logging.debug(f"ignored (extension: {extension}).")
         return
     if not only_infos:
@@ -126,6 +132,8 @@ def download_image(info: dict, tag: str, only_infos: bool = False) -> None:
         f.write("\n".join(tags.split(" ")))
     with open(jsonpath, "w") as f:
         json.dump(info, f, indent=4)
+    with open(os.path.join(OUTPUT_FOLDER, formatted_tag, "manifest.txt"), "a") as f:
+        f.write(f"{id}\n")
     logging.debug("done!")
 
 
@@ -164,6 +172,11 @@ def get_downloaded_ids(tag: str, rating: str | None = None) -> list[int]:
         path = os.path.join(path, rating)
     files = glob.glob(f"{path}/*/*_infos.json", recursive=True)
     ids = [int(os.path.basename(file).split("_")[0]) for file in files]
+    manifest_ids = []
+    try:
+        manifest_ids = open(os.path.join(path, "manifest.txt"), "r").read().splitlines()
+    except FileNotFoundError:
+        pass
     return ids
 
 def get_images_infos(tag: str, limit: int | None = None, rating: str | None = None) -> list[dict]:
@@ -187,23 +200,16 @@ def get_images_infos(tag: str, limit: int | None = None, rating: str | None = No
         images_count = get_images_count(tag=tag)
         limit = images_count - len(downloaded_ids)
         logging.info(f"{images_count} images found corresponding to this tag.")
-        logging.info(f"{len(downloaded_ids)} images already downloaded.")
-        logging.info(f"{limit} images to download.")
     page_limit = math.ceil(limit / MAX_ITEMS_PER_PAGE)
-    with tqdm(total=limit, desc="Getting images informations") as pbar:
-        for page in range(1, page_limit + 1):
-            if page != page_limit:
-                max_items_for_current_page = MAX_ITEMS_PER_PAGE
-            else:
-                max_items_for_current_page = limit - MAX_ITEMS_PER_PAGE * (page_limit - 1)
+    with tqdm(total=limit, desc="Getting images informations", ascii=True) as pbar2:
+        page = 1
+        successive_errors = 0
+        while page <= page_limit:
+            max_items_for_current_page = MAX_ITEMS_PER_PAGE
             # TODO: improve the following line using for example requests.get(..., params=params)
             # NOTE: requests.get() automatically encodes the parameters, which is not wanted since a lot of tags contain special characters
             images_url = f"{BASE_URL}/posts.json?"
             images_url += f"tags={tag}"
-            if limit < 10_000:
-                images_url += "+order:id" # for too large limits, ordering by id may lead to timeouts
-                if len(downloaded_ids) != 0:
-                    images_url += f"+id:>={max(downloaded_ids)}"
             if rating is not None:
                 images_url += f"+rating:{rating}"
             images_url += "&"
@@ -212,15 +218,40 @@ def get_images_infos(tag: str, limit: int | None = None, rating: str | None = No
             try:
                 response = requests.get(images_url)
             except requests.exceptions.ConnectionError:
-                print("Connection error. Retrying...")
-                continue
+                if successive_errors < SUCCESSIVE_ERRORS_LIMIT:
+                    logging.info("❌ Connection lost. Retrying...")
+                    successive_errors += 1
+                    continue
+                else:
+                    logging.info("❌ Connection lost. Skipping current page.")
+                    successive_errors = 0
+                    page += 1
+                    continue
             if response.status_code != 200:
-                continue
+                if successive_errors < SUCCESSIVE_ERRORS_LIMIT:
+                    logging.info(f"❌ Error {response.status_code} ({STATUS_CODE[response.status_code]}). Retrying...")
+                    successive_errors += 1
+                    continue
+                else:
+                    logging.info(f"❌ Error {response.status_code} ({STATUS_CODE[response.status_code]}). Skipping current page.")
+                    successive_errors = 0
+                    page += 1
+                    continue
             items = response.json()
             if len(items) == 0:
+                logging.debug("❎ Empty page found. Stopping.")
                 break
-            result += items
-            pbar.update(len(items))
+            for item in items:
+                if 'file_url' not in item:
+                    logging.debug(f"❌ Image is not available.") # NOTE: image deleted, banned, premium only, etc.
+                elif item['id'] in downloaded_ids or item in result:
+                    logging.debug(f"❌ Image already downloaded.")
+                else:
+                    logging.debug(f"✅ Image added to download queue.")
+                    result.append(item)
+            page += 1
+            pbar2.update(len(items))
+    logging.info(f"{len(result)} images ready to be downloaded.")
     return result
 
 
@@ -229,7 +260,11 @@ if __name__ == "__main__":
     # Setting up the logger
     # ---------------------
 
-    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)8s] --- %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] [%(levelname)8s] --- %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     
     # Setting up the folders
     # ----------------------
@@ -260,9 +295,13 @@ if __name__ == "__main__":
         logging.info(f"Starting collecting images for tag '{tag}'.")
         tag = tag.strip()
         kwargs = {"tag": tag}
+        ids_before = get_downloaded_ids(tag)
         infos = get_images_infos(**kwargs)
         logging.info(f"Parallelizing the downloads using {cpu_count()} processes.")
         with Pool(processes=cpu_count()) as pool:
-            with tqdm(total=len(infos), desc="Downloading images") as pbar:
+            with tqdm(total=len(infos), desc="Downloading images", ascii=True) as pbar:
                 for _ in pool.imap_unordered(unpack, [(download_image, info, tag, only_metadata) for info in infos]):
                     pbar.update()
+        ids_after = get_downloaded_ids(tag)
+        logging.info(f"{len(ids_after) - len(ids_before)} images downloaded for tag '{tag}'.")
+        
